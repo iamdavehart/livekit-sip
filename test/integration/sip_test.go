@@ -95,12 +95,13 @@ func runSIPServer(t testing.TB, lk *LiveKit) *SIPServer {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sipsrv, err := sip.NewService("", conf, mon, log, func(projectID string, _ *rpc.SIPCallObservability, _ *livekit.SIPCallInfo) sip.StateHandler { return sip.NewRPCStateHandler(psrpcCli) })
+	callControl := service.NewRedisCallControlWithClient(conf, log, psrpcCli, bus)
+	sipsrv, err := sip.NewService("", conf, mon, log, callControl.StateHandler)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	svc := service.NewService(conf, log, sipsrv, sipsrv.Stop, sipsrv.ActiveCalls, psrpcCli, bus, mon)
+	svc := service.NewService(conf, log, sipsrv, sipsrv.Stop, sipsrv.ActiveCalls, callControl, mon)
 	sipsrv.SetHandler(svc)
 	t.Cleanup(func() {
 		svc.Stop(true)

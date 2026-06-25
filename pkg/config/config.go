@@ -81,7 +81,7 @@ type TCPConfig struct {
 }
 
 type Config struct {
-	Redis     *redis.RedisConfig `yaml:"redis"`      // required
+	Redis     *redis.RedisConfig `yaml:"redis"`      // required for livekit_rpc control provider
 	ApiKey    string             `yaml:"api_key"`    // required (env LIVEKIT_API_KEY)
 	ApiSecret string             `yaml:"api_secret"` // required (env LIVEKIT_API_SECRET)
 	WsUrl     string             `yaml:"ws_url"`     // required (env LIVEKIT_WS_URL)
@@ -136,9 +136,11 @@ type Config struct {
 	AddRecordRoute bool `yaml:"add_record_route"`
 
 	// AudioDTMF forces SIP to generate audio DTMF tones in addition to digital.
-	AudioDTMF              bool    `yaml:"audio_dtmf"`
-	EnableJitterBuffer     bool    `yaml:"enable_jitter_buffer"`
-	EnableJitterBufferProb float64 `yaml:"enable_jitter_buffer_prob"`
+	AudioDTMF              bool          `yaml:"audio_dtmf"`
+	EnableJitterBuffer     bool          `yaml:"enable_jitter_buffer"`
+	EnableJitterBufferProb float64       `yaml:"enable_jitter_buffer_prob"`
+	Video                  VideoConfig   `yaml:"video"`
+	Control                ControlConfig `yaml:"control"`
 
 	// internal
 	ServiceName string `yaml:"-"`
@@ -152,12 +154,54 @@ type Config struct {
 	} `yaml:"experimental"`
 }
 
+type VideoConfig struct {
+	Enabled           bool   `yaml:"enabled"`
+	Codec             string `yaml:"codec"`
+	Bridge            string `yaml:"bridge"`
+	FallbackAudioOnly bool   `yaml:"fallback_audio_only"`
+}
+
+const (
+	CallControlProviderLiveKitRPC = "livekit_rpc"
+	CallControlProviderLiveKitAPI = "livekit_api"
+	CallControlProviderStatic     = "static"
+)
+
+type ControlConfig struct {
+	Provider   string                  `yaml:"provider"`
+	LiveKitAPI LiveKitAPIControlConfig `yaml:"livekit_api"`
+	Static     StaticControlConfig     `yaml:"static"`
+}
+
+type LiveKitAPIControlConfig struct {
+	ProjectID                        string `yaml:"project_id"`
+	DefaultParticipantIdentityPrefix string `yaml:"default_participant_identity_prefix"`
+}
+
+type StaticControlConfig struct {
+	ProjectID           string            `yaml:"project_id"`
+	TrunkID             string            `yaml:"trunk_id"`
+	RoomName            string            `yaml:"room_name"`
+	ParticipantIdentity string            `yaml:"participant_identity"`
+	ParticipantName     string            `yaml:"participant_name"`
+	ParticipantMetadata string            `yaml:"participant_metadata"`
+	Attributes          map[string]string `yaml:"attributes"`
+}
+
 func NewConfig(confString string) (*Config, error) {
 	conf := &Config{
 		ApiKey:      os.Getenv("LIVEKIT_API_KEY"),
 		ApiSecret:   os.Getenv("LIVEKIT_API_SECRET"),
 		WsUrl:       os.Getenv("LIVEKIT_WS_URL"),
 		ServiceName: "sip",
+		Video: VideoConfig{
+			Codec:             "h264",
+			Bridge:            "h264",
+			FallbackAudioOnly: true,
+		},
+		Control: ControlConfig{
+			Provider: CallControlProviderLiveKitRPC,
+		},
 	}
 	if confString != "" {
 		if err := yaml.Unmarshal([]byte(confString), conf); err != nil {
@@ -165,8 +209,16 @@ func NewConfig(confString string) (*Config, error) {
 		}
 	}
 
-	if conf.Redis == nil {
+	if conf.Control.Provider == "" {
+		conf.Control.Provider = CallControlProviderLiveKitRPC
+	}
+	if conf.Control.Provider == CallControlProviderLiveKitRPC && conf.Redis == nil {
 		return nil, psrpc.NewErrorf(psrpc.InvalidArgument, "redis configuration is required")
+	}
+	if conf.Control.Provider == CallControlProviderLiveKitAPI {
+		if conf.ApiKey == "" || conf.ApiSecret == "" || conf.WsUrl == "" {
+			return nil, psrpc.NewErrorf(psrpc.InvalidArgument, "api_key, api_secret, and ws_url are required for livekit_api control provider")
+		}
 	}
 
 	return conf, nil
@@ -174,6 +226,12 @@ func NewConfig(confString string) (*Config, error) {
 
 func (c *Config) Init() error {
 	c.NodeID = guid.New("NE_")
+	if c.Control.Provider == "" {
+		c.Control.Provider = CallControlProviderLiveKitRPC
+	}
+	if c.Control.LiveKitAPI.DefaultParticipantIdentityPrefix == "" {
+		c.Control.LiveKitAPI.DefaultParticipantIdentityPrefix = "sip"
+	}
 
 	if c.SIPPort == 0 {
 		c.SIPPort = DefaultSIPPort
@@ -207,6 +265,12 @@ func (c *Config) Init() error {
 	}
 	if c.MaxCpuUtilization <= 0 || c.MaxCpuUtilization > 1 {
 		c.MaxCpuUtilization = 0.9
+	}
+	if c.Video.Codec == "" {
+		c.Video.Codec = "h264"
+	}
+	if c.Video.Bridge == "" {
+		c.Video.Bridge = "h264"
 	}
 
 	if err := c.InitLogger(); err != nil {

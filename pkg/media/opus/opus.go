@@ -63,9 +63,17 @@ func Decode(w msdk.PCM16Writer, channels int, log logger.Logger) (Writer, error)
 		w:   w,
 		p:   p,
 		dec: dec,
-		buf: make([]int16, w.SampleRate()/rtp.DefFramesPerSec),
+		buf: make([]int16, maxDecodeSamples(rate, channels)),
 		log: log,
 	}, nil
+}
+
+func maxDecodeSamples(sampleRate, channels int) int {
+	const maxOpusFrameMs = 120
+	if channels <= 0 {
+		channels = 1
+	}
+	return sampleRate * channels * maxOpusFrameMs / 1000
 }
 
 func Encode(w Writer, channels int, log logger.Logger) (msdk.PCM16Writer, error) {
@@ -119,10 +127,23 @@ func (d *decoder) WriteSample(in Sample) error {
 	if err != nil {
 		// Some workflows (concatenating opus files) can cause a suprious decoding error, so ignore small amount of corruption errors
 		if !errors.Is(err, opus.ErrInvalidPacket) || d.successiveErrorCount >= 5 {
-			d.log.Warnw("error decoding opus sample", err)
+			d.log.Warnw("error decoding opus sample", err,
+				"inputBytes", len(in),
+				"decodeBufferSamples", len(d.buf),
+				"sampleRate", d.p.SampleRate,
+				"channels", d.p.Channels,
+				"successiveErrorCount", d.successiveErrorCount,
+			)
 			return err
 		}
-		d.log.Debugw("opus decoder failed decoding a sample", "error", err)
+		d.log.Debugw("opus decoder failed decoding a sample",
+			"error", err,
+			"inputBytes", len(in),
+			"decodeBufferSamples", len(d.buf),
+			"sampleRate", d.p.SampleRate,
+			"channels", d.p.Channels,
+			"successiveErrorCount", d.successiveErrorCount,
+		)
 		d.successiveErrorCount++
 		return nil
 	}

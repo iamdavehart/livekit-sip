@@ -237,6 +237,14 @@ func (r *testRoom) NewParticipantTrack(sampleRate int) (msdk.WriteCloser[msdk.PC
 	return &noOpWriter{}, nil
 }
 
+func (r *testRoom) NewParticipantVideoTrack(codec VideoCodecConfig) (rtp.HandlerCloser, error) {
+	return rtp.NewNopCloser(rtp.HandlerFunc(nil)), nil
+}
+
+func (r *testRoom) SetVideoOutput(w rtp.WriteStream) {
+	r.room.SetVideoOutput(w)
+}
+
 // noOpWriter is a no-op implementation of msdk.WriteCloser for testing
 type noOpWriter struct{}
 

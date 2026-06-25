@@ -1,0 +1,275 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Self-contained EC2 test host for livekit-sip in its own VPC.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: livekit-sip-test
+    Description: Prefix used for named resources.
+
+  InstanceType:
+    Type: String
+    Default: t3.small
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3.large
+      - t4g.micro
+      - t4g.small
+      - t4g.medium
+    Description: EC2 instance type.
+
+  Architecture:
+    Type: String
+    Default: x8664
+    AllowedValues:
+      - x8664
+      - arm64
+    Description: CPU architecture. Choose x8664 for t3 instances or arm64 for t4g instances.
+
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Existing EC2 key pair for SSH access.
+
+  AdminCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: CIDR allowed to SSH to the instance. Set this to your current public IP/32.
+
+  SipIngressCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: CIDR allowed to reach SIP signaling ports.
+
+  RtpIngressCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: CIDR allowed to reach RTP media ports.
+
+  SipPort:
+    Type: Number
+    Default: 5060
+    MinValue: 1
+    MaxValue: 65535
+    Description: SIP signaling port opened for TCP and UDP.
+
+  RtpPortStart:
+    Type: Number
+    Default: 20000
+    MinValue: 1024
+    MaxValue: 65535
+    Description: First UDP RTP media port opened.
+
+  RtpPortEnd:
+    Type: Number
+    Default: 20100
+    MinValue: 1024
+    MaxValue: 65535
+    Description: Last UDP RTP media port opened.
+
+  VpcCidr:
+    Type: String
+    Default: 10.77.0.0/16
+    Description: CIDR for the dedicated VPC.
+
+  PublicSubnetCidr:
+    Type: String
+    Default: 10.77.1.0/24
+    Description: CIDR for the public subnet.
+
+Mappings:
+  AmiParameter:
+    x8664:
+      Name: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    arm64:
+      Name: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-igw
+
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref Vpc
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnetCidr
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-public-a
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-public-rt
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet
+
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Access for livekit-sip test host
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - Description: SSH from admin CIDR
+          IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AdminCidr
+        - Description: SIP UDP
+          IpProtocol: udp
+          FromPort: !Ref SipPort
+          ToPort: !Ref SipPort
+          CidrIp: !Ref SipIngressCidr
+        - Description: SIP TCP
+          IpProtocol: tcp
+          FromPort: !Ref SipPort
+          ToPort: !Ref SipPort
+          CidrIp: !Ref SipIngressCidr
+        - Description: RTP UDP range
+          IpProtocol: udp
+          FromPort: !Ref RtpPortStart
+          ToPort: !Ref RtpPortEnd
+          CidrIp: !Ref RtpIngressCidr
+      SecurityGroupEgress:
+        - Description: Allow all outbound
+          IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-sg
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-instance-role
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref InstanceRole
+
+  Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Sub
+        - "{{resolve:ssm:${AmiParameter}}}"
+        - AmiParameter: !FindInMap [AmiParameter, !Ref Architecture, Name]
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      KeyName: !Ref KeyName
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref InstanceSecurityGroup
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 30
+            VolumeType: gp3
+            DeleteOnTermination: true
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+
+          dnf update -y
+          dnf install -y docker git tcpdump jq htop
+          systemctl enable --now docker
+          usermod -aG docker ec2-user
+
+          cat >/etc/profile.d/livekit-sip-test.sh <<'EOF'
+          export LIVEKIT_SIP_PUBLIC_IP="${ElasticIp}"
+          export LIVEKIT_SIP_PORT="${SipPort}"
+          export LIVEKIT_SIP_RTP_START="${RtpPortStart}"
+          export LIVEKIT_SIP_RTP_END="${RtpPortEnd}"
+          EOF
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-host
+
+  ElasticIp:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-eip
+
+  ElasticIpAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt ElasticIp.AllocationId
+      InstanceId: !Ref Instance
+
+Outputs:
+  InstanceId:
+    Description: EC2 instance ID.
+    Value: !Ref Instance
+
+  PublicIp:
+    Description: Elastic public IP for SIP and SSH.
+    Value: !Ref ElasticIp
+
+  PublicDnsName:
+    Description: EC2 public DNS name.
+    Value: !GetAtt Instance.PublicDnsName
+
+  SshCommand:
+    Description: SSH command template.
+    Value: !Sub ssh ec2-user@${ElasticIp}
+
+  SipEndpoint:
+    Description: SIP endpoint host:port.
+    Value: !Sub ${ElasticIp}:${SipPort}
+
+  RtpPortRange:
+    Description: UDP RTP media range opened on the security group.
+    Value: !Sub ${RtpPortStart}-${RtpPortEnd}

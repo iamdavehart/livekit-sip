@@ -178,6 +178,46 @@ func newUDPPipe() (c1, c2 *testUDPConn) {
 	return
 }
 
+func TestVideoRTPWriteStreamUsesSymmetricDestination(t *testing.T) {
+	log := logger.GetLogger().WithName(t.Name())
+	c1, c2 := newUDPPipe()
+
+	port := newUDPConn(log, c1, true)
+	privateRemote := netip.MustParseAddrPort("192.168.1.251:54779")
+	port.SetDst(privateRemote)
+
+	_, err := c2.WriteToUDPAddrPort([]byte{0xaa}, c1.addr)
+	require.NoError(t, err)
+	buf := make([]byte, 1)
+	_, err = port.Read(buf)
+	require.NoError(t, err)
+
+	w := &videoRTPWriteStream{
+		port:        port,
+		remote:      privateRemote,
+		payloadType: 97,
+	}
+	_, err = w.WriteRTP(&rtp.Header{
+		Version:        2,
+		PayloadType:    96,
+		SequenceNumber: 1234,
+		Timestamp:      5678,
+		SSRC:           9012,
+	}, []byte{0x01, 0x02, 0x03})
+	require.NoError(t, err)
+
+	select {
+	case packet := <-c2.buf:
+		var h rtp.Header
+		n, err := h.Unmarshal(packet)
+		require.NoError(t, err)
+		require.Equal(t, uint8(97), h.PayloadType)
+		require.Equal(t, []byte{0x01, 0x02, 0x03}, packet[n:])
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for video RTP packet")
+	}
+}
+
 func PrintAudioInWriter(p *MediaPort) string {
 	return p.audioInHandler.(fmt.Stringer).String()
 }

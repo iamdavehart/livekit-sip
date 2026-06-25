@@ -26,13 +26,11 @@ import (
 
 	"github.com/frostbyte73/core"
 	msdk "github.com/livekit/media-sdk"
-	"github.com/livekit/psrpc/pkg/middleware/otelpsrpc"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
 	"github.com/livekit/protocol/rpc"
-	"github.com/livekit/psrpc"
 
 	"github.com/livekit/sip/pkg/stats"
 
@@ -49,13 +47,11 @@ type Service struct {
 	log  logger.Logger
 
 	psrpcServer rpc.SIPInternalServerImpl
-	psrpcClient rpc.IOInfoSIPClient
-	bus         psrpc.MessageBus
+	control     CallControl
 
 	promServer   *http.Server
 	pprofServer  *http.Server
 	healthServer *http.Server
-	rpcSIPServer rpc.SIPInternalServer
 
 	sipServiceStop        sipServiceStopFunc
 	sipServiceActiveCalls sipServiceActiveCallsFunc
@@ -67,15 +63,14 @@ type Service struct {
 
 func NewService(
 	conf *config.Config, log logger.Logger, srv rpc.SIPInternalServerImpl, sipServiceStop sipServiceStopFunc,
-	sipServiceActiveCalls sipServiceActiveCallsFunc, cli rpc.IOInfoSIPClient, bus psrpc.MessageBus, mon *stats.Monitor,
+	sipServiceActiveCalls sipServiceActiveCallsFunc, control CallControl, mon *stats.Monitor,
 ) *Service {
 	s := &Service{
 		conf: conf,
 		log:  log,
 
 		psrpcServer: srv,
-		psrpcClient: cli,
-		bus:         bus,
+		control:     control,
 
 		sipServiceStop:        sipServiceStop,
 		sipServiceActiveCalls: sipServiceActiveCalls,
@@ -168,23 +163,15 @@ func (s *Service) Run() error {
 		}()
 	}
 
-	var err error
-	if s.rpcSIPServer, err = rpc.NewSIPInternalServer(s.psrpcServer, s.bus,
-		otelpsrpc.ServerOptions(otelpsrpc.Config{}),
-	); err != nil {
+	if err := s.control.Start(s.psrpcServer); err != nil {
 		return err
 	}
-	defer s.rpcSIPServer.Shutdown()
-
-	if err := s.RegisterCreateSIPParticipantTopic(); err != nil {
-		return err
-	}
+	defer s.control.Stop()
 
 	s.log.Debugw("service ready")
 
 	<-s.shutdown.Watch()
 	s.log.Infow("shutting down")
-	s.DeregisterCreateSIPParticipantTopic()
 
 	if !s.killed.Load() {
 		shutdownTicker := time.NewTicker(5 * time.Second)
@@ -210,53 +197,33 @@ func (s *Service) Run() error {
 }
 
 func (s *Service) GetAuthCredentials(ctx context.Context, call *rpc.SIPCall) (sip.AuthInfo, error) {
-	return GetAuthCredentials(ctx, s.psrpcClient, call)
+	return s.control.GetAuthCredentials(ctx, call)
 }
 
 func (s *Service) DispatchCall(ctx context.Context, info *sip.CallInfo) sip.CallDispatch {
-	return DispatchCall(ctx, s.psrpcClient, s.log, info)
+	return s.control.DispatchCall(ctx, info)
 }
 
-func (s *Service) GetMediaProcessor(_ []livekit.SIPFeature, _ map[string]string, _ string, _ sip.MediaProcessorOpts) msdk.PCM16Processor {
-	return nil
+func (s *Service) GetMediaProcessor(features []livekit.SIPFeature, featureFlags map[string]string, callID string, opts sip.MediaProcessorOpts) msdk.PCM16Processor {
+	return s.control.GetMediaProcessor(features, featureFlags, callID, opts)
 }
 
 func (s *Service) Health() stats.HealthStatus {
 	return s.mon.Health()
 }
 
-func (s *Service) RegisterCreateSIPParticipantTopic() error {
-	if s.rpcSIPServer != nil {
-		return s.rpcSIPServer.RegisterCreateSIPParticipantTopic(s.conf.ClusterID)
-	}
-
-	return nil
-}
-
-func (s *Service) DeregisterCreateSIPParticipantTopic() {
-	if s.rpcSIPServer != nil {
-		s.rpcSIPServer.DeregisterCreateSIPParticipantTopic(s.conf.ClusterID)
-	}
-}
-
 func (s *Service) RegisterTransferSIPParticipantTopic(sipCallId string) error {
-	if s.rpcSIPServer != nil {
-		return s.rpcSIPServer.RegisterTransferSIPParticipantTopic(sipCallId)
-	}
-
-	return psrpc.NewErrorf(psrpc.Internal, "RPC server not started")
+	return s.control.RegisterTransferSIPParticipantTopic(sipCallId)
 }
 
 func (s *Service) DeregisterTransferSIPParticipantTopic(sipCallId string) {
-	if s.rpcSIPServer != nil {
-		s.rpcSIPServer.DeregisterTransferSIPParticipantTopic(sipCallId)
-	}
+	s.control.DeregisterTransferSIPParticipantTopic(sipCallId)
 }
 
 func (s *Service) OnInboundInfo(log logger.Logger, callInfo *rpc.SIPCall, headers sip.Headers) {
-
+	s.control.OnInboundInfo(log, callInfo, headers)
 }
 
 func (s *Service) OnSessionEnd(ctx context.Context, callIdentifier *sip.CallIdentifier, state *sip.CallState, reason string) {
-	s.log.Infow("SIP call ended", "callID", callIdentifier.CallID, "reason", reason)
+	s.control.OnSessionEnd(ctx, callIdentifier, state, reason)
 }

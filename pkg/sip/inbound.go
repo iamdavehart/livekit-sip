@@ -691,6 +691,7 @@ type inboundCall struct {
 	mmu         sync.Mutex
 	media       *MediaPort
 	mediaCodecs *msdk.CodecSet
+	videoBridge VideoBridge
 	dtmf        chan dtmf.Event // buffered
 	endCall     chan EndCall    // buffered
 	lkRoom      RoomInterface   // LiveKit room; only active after correct pin is entered
@@ -1108,6 +1109,8 @@ func (c *inboundCall) runMediaConn(tid traceid.ID, offerData []byte, mconf *sipM
 		NoInputResample:      !RoomResample,
 		DrainingIdleTimeout:  conf.RTPDrainingIdleTimeout,
 		DrainingDuration:     conf.RTPDrainingDuration,
+		VideoEnabled:         conf.Video.Enabled,
+		VideoCodec:           conf.Video.Codec,
 	}, RoomSampleRate)
 	if err != nil {
 		return nil, err
@@ -1493,6 +1496,10 @@ func (c *inboundCall) closeMedia() {
 	c.lkRoom.Close()
 	c.mmu.Lock()
 	defer c.mmu.Unlock()
+	if c.videoBridge != nil {
+		c.videoBridge.Close()
+		c.videoBridge = nil
+	}
 	if c.media != nil {
 		c.media.Close()
 	}
@@ -1564,6 +1571,43 @@ func (c *inboundCall) publishTrack() error {
 		return err
 	}
 	c.media.WriteAudioTo(local)
+	if err = c.publishVideoTrack(); err != nil {
+		if c.s.conf.Video.FallbackAudioOnly {
+			c.log().Warnw("Cannot publish video track, continuing audio-only", err)
+			return nil
+		}
+		_ = c.lkRoom.Close()
+		return err
+	}
+	return nil
+}
+
+func (c *inboundCall) publishVideoTrack() error {
+	if !c.s.conf.Video.Enabled {
+		return nil
+	}
+	mconf := c.media.Config()
+	if mconf == nil || mconf.Video == nil {
+		return nil
+	}
+	factory, ok := getVideoBridge(c.s.conf.Video.Bridge)
+	if !ok {
+		return fmt.Errorf("video bridge %q is not registered", c.s.conf.Video.Bridge)
+	}
+	bridge, err := factory(VideoBridgeParams{
+		Log:   c.log(),
+		Room:  c.lkRoom,
+		Media: c.media,
+		Codec: *mconf.Video,
+	})
+	if err != nil {
+		return err
+	}
+	if err = bridge.Start(c.ctx); err != nil {
+		bridge.Close()
+		return err
+	}
+	c.videoBridge = bridge
 	return nil
 }
 

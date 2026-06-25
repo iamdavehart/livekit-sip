@@ -23,13 +23,8 @@ import (
 
 	"github.com/urfave/cli/v3"
 
-	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
-	"github.com/livekit/protocol/redis"
-	"github.com/livekit/protocol/rpc"
 	"github.com/livekit/protocol/tracer/jaeger"
-	"github.com/livekit/psrpc"
-	"github.com/livekit/psrpc/pkg/middleware/otelpsrpc"
 
 	"github.com/livekit/sip/pkg/config"
 	"github.com/livekit/sip/pkg/errors"
@@ -75,16 +70,11 @@ func runService(ctx context.Context, c *cli.Command) error {
 		jaeger.Configure(ctx, conf.JaegerURL, conf.ServiceName)
 	}
 
-	rc, err := redis.GetRedisClient(conf.Redis)
+	callControl, err := service.NewCallControl(conf, log)
 	if err != nil {
 		return err
 	}
-
-	bus := psrpc.NewRedisMessageBus(rc)
-	psrpcClient, err := rpc.NewIOInfoClient(bus,
-		otelpsrpc.ClientOptions(otelpsrpc.Config{}),
-	)
-	if err != nil {
+	if err = callControl.Init(ctx); err != nil {
 		return err
 	}
 
@@ -99,11 +89,11 @@ func runService(ctx context.Context, c *cli.Command) error {
 		return err
 	}
 
-	sipsrv, err := sip.NewService("", conf, mon, log, func(projectID string, _ *rpc.SIPCallObservability, _ *livekit.SIPCallInfo) sip.StateHandler { return sip.NewRPCStateHandler(psrpcClient) })
+	sipsrv, err := sip.NewService("", conf, mon, log, callControl.StateHandler)
 	if err != nil {
 		return err
 	}
-	svc := service.NewService(conf, log, sipsrv, sipsrv.Stop, sipsrv.ActiveCalls, psrpcClient, bus, mon)
+	svc := service.NewService(conf, log, sipsrv, sipsrv.Stop, sipsrv.ActiveCalls, callControl, mon)
 	sipsrv.SetHandler(svc)
 
 	if err = sipsrv.Start(); err != nil {

@@ -164,6 +164,8 @@ type RoomInterface interface {
 	SendData(data lksdk.DataPacket, opts ...lksdk.DataPublishOption) error
 	NewTrack() *mixer.Input
 	lksdk.RoomRPCInterface
+	NewParticipantVideoTrack(codec VideoCodecConfig) (rtp.HandlerCloser, error)
+	SetVideoOutput(w rtp.WriteStream)
 }
 
 type GetRoomFunc func(log logger.Logger, st *RoomStats) RoomInterface
@@ -173,19 +175,21 @@ func DefaultGetRoomFunc(log logger.Logger, st *RoomStats) RoomInterface {
 }
 
 type Room struct {
-	log        logger.Logger
-	roomLog    logger.Logger // deferred logger
-	room       *lksdk.Room
-	mix        *mixer.Mixer
-	out        *msdk.SwitchWriter
-	outDtmf    atomic.Pointer[dtmf.Writer]
-	p          ParticipantInfo
-	ready      core.Fuse
-	subscribe  atomic.Bool
-	subscribed core.Fuse
-	stopped    core.Fuse
-	closed     core.Fuse
-	stats      *RoomStats
+	log             logger.Logger
+	roomLog         logger.Logger // deferred logger
+	room            *lksdk.Room
+	mix             *mixer.Mixer
+	out             *msdk.SwitchWriter
+	outDtmf         atomic.Pointer[dtmf.Writer]
+	videoOut        atomic.Pointer[rtp.WriteStream]
+	videoSubscribed atomic.Bool
+	p               ParticipantInfo
+	ready           core.Fuse
+	subscribe       atomic.Bool
+	subscribed      core.Fuse
+	stopped         core.Fuse
+	closed          core.Fuse
+	stats           *RoomStats
 }
 
 type ParticipantConfig struct {
@@ -291,7 +295,24 @@ func (r *Room) participantLeft(rp *lksdk.RemoteParticipant) {
 func (r *Room) subscribeTo(pub *lksdk.RemoteTrackPublication, rp *lksdk.RemoteParticipant) {
 	log := r.roomLog.WithValues("participant", rp.Identity(), "participantID", rp.SID(), "trackID", pub.SID(), "trackName", pub.Name())
 	if pub.Kind() != lksdk.TrackKindAudio {
-		log.Debugw("skipping non-audio track")
+		if pub.Kind() != lksdk.TrackKindVideo {
+			log.Debugw("skipping non-audio track")
+			return
+		}
+		if r.videoOut.Load() == nil {
+			log.Debugw("skipping video track - video output is not set")
+			return
+		}
+		if !r.videoSubscribed.CompareAndSwap(false, true) {
+			log.Debugw("skipping video track - already subscribed to video")
+			return
+		}
+		log.Debugw("subscribing to a video track")
+		if err := pub.SetSubscribed(true); err != nil {
+			r.videoSubscribed.Store(false)
+			log.Errorw("cannot subscribe to the video track", err)
+			return
+		}
 		return
 	}
 	log.Debugw("subscribing to a track")
@@ -342,6 +363,10 @@ func (r *Room) Connect(ctx context.Context, conf *config.Config, rconf RoomConfi
 						return
 					}
 					defer func() { log.Infow("track closed", "closedAt", time.Now().UnixMilli()) }()
+					if track.Kind() == webrtc.RTPCodecTypeVideo {
+						r.handleVideoTrack(log, track)
+						return
+					}
 
 					mTrack := r.NewTrack()
 					if mTrack == nil {
@@ -528,6 +553,48 @@ func (r *Room) SetDTMFOutput(w dtmf.Writer) {
 	r.outDtmf.Store(&w)
 }
 
+func (r *Room) SetVideoOutput(w rtp.WriteStream) {
+	if r == nil {
+		return
+	}
+	if w == nil {
+		r.videoOut.Store(nil)
+		r.videoSubscribed.Store(false)
+		return
+	}
+	r.videoOut.Store(&w)
+}
+
+func (r *Room) handleVideoTrack(log logger.Logger, track *webrtc.TrackRemote) {
+	out := r.videoOut.Load()
+	if out == nil {
+		log.Debugw("ignoring video track - video output is not set")
+		return
+	}
+	codec := track.Codec()
+	if !strings.EqualFold(codec.MimeType, webrtc.MimeTypeH264) {
+		log.Warnw("unsupported room video codec", nil, "codec", codec.MimeType)
+		return
+	}
+	for {
+		p, _, err := track.ReadRTP()
+		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				log.Infow("room video rtp handler returned with failure", "error", err)
+			}
+			return
+		}
+		cur := r.videoOut.Load()
+		if cur == nil {
+			return
+		}
+		if _, err = (*cur).WriteRTP(&p.Header, p.Payload); err != nil {
+			log.Infow("cannot forward room video to sip", "error", err)
+			return
+		}
+	}
+}
+
 func (r *Room) sendDTMF(ctx context.Context, msg *livekit.SipDTMF) {
 	outDTMF := r.outDtmf.Load()
 	if outDTMF == nil {
@@ -592,6 +659,41 @@ func (r *Room) NewParticipantTrack(sampleRate int) (msdk.WriteCloser[msdk.PCM16S
 	}
 	return newMediaWriterCount(pw, &r.stats.PublishedFrames, &r.stats.PublishedSamples), nil
 }
+
+func (r *Room) NewParticipantVideoTrack(codec VideoCodecConfig) (rtp.HandlerCloser, error) {
+	track, err := webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{
+		MimeType:    codec.MimeType,
+		ClockRate:   codec.ClockRate,
+		SDPFmtpLine: codec.FMTPLine,
+	}, "video", "pion")
+	if err != nil {
+		return nil, err
+	}
+	p := r.room.LocalParticipant
+	if _, err = p.PublishTrack(track, &lksdk.TrackPublicationOptions{
+		Name: p.Identity() + "-video",
+	}); err != nil {
+		return nil, err
+	}
+	return &videoTrackHandler{track: track}, nil
+}
+
+type videoTrackHandler struct {
+	track *webrtc.TrackLocalStaticRTP
+}
+
+func (h *videoTrackHandler) String() string {
+	return "SIPVideoRTP -> LiveKit"
+}
+
+func (h *videoTrackHandler) HandleRTP(header *rtp.Header, payload []byte) error {
+	return h.track.WriteRTP(&rtp.Packet{
+		Header:  *header,
+		Payload: payload,
+	})
+}
+
+func (h *videoTrackHandler) Close() {}
 
 func (r *Room) SendData(data lksdk.DataPacket, opts ...lksdk.DataPublishOption) error {
 	if r == nil || !r.ready.IsBroken() || r.closed.IsBroken() {
